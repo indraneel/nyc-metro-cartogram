@@ -12,12 +12,12 @@ Live site: [castrio.me/nyc](https://castrio.me/nyc/)
 ## What The Project Uses
 
 - NYC borough boundaries
-- MTA GTFS subway data for stations, routes, and travel times
+- MTA GTFS subway data and PATH GTFS data for stations, routes, and travel times
 - major streets and park/open-space overlays for the basemap
 - a distance-based warp for the static SVG
 - a station-to-station network plus walking access model for the interactive commute map
 
-The interactive app includes the Staten Island Ferry connection, but it does not model buses, regional rail, or real-time schedules.
+The interactive app includes the PATH train (with explicit WTC↔Fulton St transfer) and the Staten Island Ferry connection, but it does not model buses, regional rail, or real-time schedules.
 
 ## Requirements
 
