@@ -362,6 +362,80 @@ def extract_route_shapes(gtfs_path: Path, lat0: float, bbox: PolygonBox) -> List
     return route_shapes
 
 
+PATH_GTFS_PATH = DATA_DIR / "path_gtfs.zip"
+PATH_DROP_ROUTE_IDS = frozenset({"Special1", "Special5"})
+
+
+def extract_path_stations(lat0: float) -> List[Point]:
+    """Read PATH stops.txt; one Point per unique station name."""
+    seen_names: set[str] = set()
+    points: List[Point] = []
+    if not PATH_GTFS_PATH.exists():
+        return points
+    for row in read_csv_from_zip(PATH_GTFS_PATH, "stops.txt"):
+        name = row["stop_name"].strip()
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        points.append(lonlat_to_xy(float(row["stop_lon"]), float(row["stop_lat"]), lat0))
+    return points
+
+
+def extract_path_route_shapes(lat0: float, bbox: PolygonBox) -> List[RouteShape]:
+    """Synthesize PATH polylines from stop sequences (no shapes.txt in feed)."""
+    if not PATH_GTFS_PATH.exists():
+        return []
+
+    route_styles: Dict[str, Tuple[str, str]] = {}
+    for row in read_csv_from_zip(PATH_GTFS_PATH, "routes.txt"):
+        route_id = row["route_id"]
+        if route_id in PATH_DROP_ROUTE_IDS or row.get("route_type") != "1":
+            continue
+        route_styles[route_id] = (
+            f"#{row['route_color'] or '808183'}",
+            f"#{row['route_text_color'] or 'FFFFFF'}",
+        )
+
+    trips: Dict[str, Tuple[str, str]] = {}
+    for row in read_csv_from_zip(PATH_GTFS_PATH, "trips.txt"):
+        if row["route_id"] not in route_styles:
+            continue
+        trips[row["trip_id"]] = (row["route_id"], row.get("direction_id", "0"))
+
+    stop_coords: Dict[str, Point] = {}
+    for row in read_csv_from_zip(PATH_GTFS_PATH, "stops.txt"):
+        stop_coords[row["stop_id"]] = lonlat_to_xy(
+            float(row["stop_lon"]), float(row["stop_lat"]), lat0
+        )
+
+    trip_stops: Dict[str, List[Tuple[int, str]]] = {}
+    for row in read_csv_from_zip(PATH_GTFS_PATH, "stop_times.txt"):
+        trip_id = row["trip_id"]
+        if trip_id not in trips:
+            continue
+        trip_stops.setdefault(trip_id, []).append((int(row["stop_sequence"]), row["stop_id"]))
+
+    longest_per_dir: Dict[Tuple[str, str], str] = {}
+    for trip_id, stops in trip_stops.items():
+        key = trips[trip_id]
+        if key not in longest_per_dir or len(stops) > len(trip_stops[longest_per_dir[key]]):
+            longest_per_dir[key] = trip_id
+
+    shapes: List[RouteShape] = []
+    for (route_id, _direction), trip_id in longest_per_dir.items():
+        ordered = sorted(trip_stops[trip_id])
+        polyline: List[Point] = []
+        for _, stop_id in ordered:
+            point = stop_coords.get(stop_id)
+            if point and (not polyline or point != polyline[-1]):
+                polyline.append(point)
+        if len(polyline) < 2:
+            continue
+        color, text_color = route_styles[route_id]
+        shapes.append(RouteShape(route_id=route_id, color=color, text_color=text_color, points=polyline))
+    return shapes
+
+
 def build_station_index(
     stations: Sequence[Point], cell_size: float
 ) -> Tuple[Dict[Tuple[int, int], List[Point]], float]:
@@ -731,13 +805,27 @@ def main() -> None:
 
     boroughs = extract_boroughs(borough_payload, lat0)
     borough_shapes = [polygon for borough in boroughs for polygon in borough.geometry]
-    bbox = bounds_of_multipolygon(borough_shapes)
+    nyc_bbox = bounds_of_multipolygon(borough_shapes)
+
+    path_stations = extract_path_stations(lat0)
+    if path_stations:
+        path_xs = [p[0] for p in path_stations]
+        path_ys = [p[1] for p in path_stations]
+        margin = 1500.0
+        bbox = (
+            min(nyc_bbox[0], min(path_xs) - margin),
+            min(nyc_bbox[1], min(path_ys) - margin),
+            max(nyc_bbox[2], max(path_xs) + margin),
+            max(nyc_bbox[3], max(path_ys) + margin),
+        )
+    else:
+        bbox = nyc_bbox
     min_x, min_y, max_x, max_y = bbox
 
     parks = extract_parks(lat0, bbox)
     streets = extract_major_streets(lat0, bbox)
-    stations = extract_station_points(GTFS_PATH, lat0)
-    route_shapes = extract_route_shapes(GTFS_PATH, lat0, bbox)
+    stations = extract_station_points(GTFS_PATH, lat0) + path_stations
+    route_shapes = extract_route_shapes(GTFS_PATH, lat0, bbox) + extract_path_route_shapes(lat0, bbox)
 
     polygon_boxes = build_polygon_boxes(borough_shapes)
     grid, cell_w, cell_h = build_weight_grid(borough_shapes, polygon_boxes, stations, bbox)

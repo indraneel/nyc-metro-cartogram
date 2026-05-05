@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
+import path_gtfs
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -357,6 +359,18 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _upsert_serialized_edge(adjacency: list, from_state: int, to_state: int, weight: float) -> None:
+    """Insert or relax an edge in the serialized adjacency list (lists of [to, weight] pairs)."""
+    edges = adjacency[from_state]
+    for edge in edges:
+        if edge[0] == to_state:
+            if weight < edge[1]:
+                edge[1] = weight
+            return
+    edges.append([to_state, weight])
+    edges.sort(key=lambda e: e[0])
+
+
 def build_station_data(lat0: float) -> Tuple[list, Dict[str, int], Dict[str, str]]:
     complex_info: Dict[str, dict] = {}
     stop_to_complex: Dict[str, str] = {}
@@ -487,13 +501,12 @@ def build_route_waits(trips_by_id: dict) -> Dict[str, float]:
     return route_waits
 
 
-def build_graph(
+def collect_mta_durations(
     stations: list,
     station_index_by_id: Dict[str, int],
     stop_to_complex: Dict[str, str],
     trips_by_id: dict,
-    route_waits: Dict[str, float],
-) -> Tuple[list, list, list]:
+) -> Dict[Tuple[int, int, str], List[float]]:
     durations_by_edge: Dict[Tuple[int, int, str], List[float]] = defaultdict(list)
     current_trip_id = None
     current_rows: List[dict] = []
@@ -533,7 +546,14 @@ def build_graph(
         current_rows.append(row)
     if current_trip_id and current_rows:
         process_trip(current_trip_id, current_rows)
+    return durations_by_edge
 
+
+def build_graph(
+    stations: list,
+    durations_by_edge: Dict[Tuple[int, int, str], List[float]],
+    route_waits: Dict[str, float],
+) -> Tuple[list, list, list]:
     route_states = []
     state_index_by_key: Dict[Tuple[int, str], int] = {}
     station_states: List[List[int]] = [[] for _ in stations]
@@ -717,16 +737,87 @@ def main() -> None:
     borough_payload = load_json(BOROUGHS_PATH)
     lat0 = average_borough_latitude(borough_payload)
     boroughs, all_polygons = extract_boroughs(borough_payload, lat0)
-    bbox = bounds_of_multipolygon(all_polygons)
+    nyc_bbox = bounds_of_multipolygon(all_polygons)
+
+    # Widen the bbox to include PATH stations so parks/streets/external-land
+    # render out to Newark.
+    path_stations_preview, _ = path_gtfs.load_path_stations(lat0)
+    if path_stations_preview:
+        path_xs = [s["point"][0] for s in path_stations_preview]
+        path_ys = [s["point"][1] for s in path_stations_preview]
+        margin = 1500.0
+        bbox = (
+            min(nyc_bbox[0], min(path_xs) - margin),
+            min(nyc_bbox[1], min(path_ys) - margin),
+            max(nyc_bbox[2], max(path_xs) + margin),
+            max(nyc_bbox[3], max(path_ys) + margin),
+        )
+    else:
+        bbox = nyc_bbox
+
     external_land = build_external_land_polygons(lat0, bbox, all_polygons)
     parks = extract_parks(lat0, bbox)
     streets = extract_streets(lat0, bbox)
+
     stations, station_index_by_id, stop_to_complex = build_station_data(lat0)
     route_styles, route_shapes, trips_by_id = build_routes_and_shapes(lat0, bbox)
     route_waits = build_route_waits(trips_by_id)
-    route_states, station_states, adjacency = build_graph(
-        stations, station_index_by_id, stop_to_complex, trips_by_id, route_waits
+
+    # Load PATH and merge into the shared structures BEFORE indexes are baked in.
+    path_stations, path_stop_to_complex = path_gtfs.load_path_stations(lat0)
+    for station in path_stations:
+        station_index_by_id[station["id"]] = len(stations)
+        stations.append(station)
+    stop_to_complex.update(path_stop_to_complex)
+
+    path_route_styles, path_route_shapes, path_trips = path_gtfs.load_path_routes_and_shapes(
+        lat0, bbox, path_stop_to_complex
     )
+    route_styles.update(path_route_styles)
+    route_shapes.extend(path_route_shapes)
+    route_waits.update(path_gtfs.compute_path_route_waits(path_trips))
+
+    durations_by_edge = collect_mta_durations(
+        stations, station_index_by_id, stop_to_complex, trips_by_id
+    )
+    path_station_routes: Dict[int, set] = {}
+    path_gtfs.compute_path_segment_durations(
+        path_trips,
+        path_stop_to_complex,
+        station_index_by_id,
+        durations_by_edge,
+        path_station_routes,
+    )
+    for station_index, routes in path_station_routes.items():
+        stations[station_index]["routes"].update(routes)
+
+    route_states, station_states, adjacency = build_graph(
+        stations, durations_by_edge, route_waits
+    )
+
+    # Apply explicit cross-system transfer overrides (e.g. WTC PATH ↔ Fulton St)
+    # that sit outside the 260m auto-walk radius.
+    for path_complex_id, mta_complex_id, walk_meters in path_gtfs.PATH_EXPLICIT_TRANSFERS:
+        if path_complex_id not in station_index_by_id or mta_complex_id not in station_index_by_id:
+            continue
+        from_index = station_index_by_id[path_complex_id]
+        to_index = station_index_by_id[mta_complex_id]
+        walk_minutes = walk_meters / WALK_METERS_PER_MINUTE + INTER_COMPLEX_WALK_PENALTY
+        for from_state in station_states[from_index]:
+            for to_state in station_states[to_index]:
+                from_route = route_states[from_state]["routeId"]
+                to_route = route_states[to_state]["routeId"]
+                forward = round(
+                    walk_minutes + INTER_COMPLEX_TRANSFER_PENALTY + route_waits.get(to_route, DEFAULT_BOARD_WAIT),
+                    2,
+                )
+                backward = round(
+                    walk_minutes + INTER_COMPLEX_TRANSFER_PENALTY + route_waits.get(from_route, DEFAULT_BOARD_WAIT),
+                    2,
+                )
+                _upsert_serialized_edge(adjacency, from_state, to_state, forward)
+                _upsert_serialized_edge(adjacency, to_state, from_state, backward)
+
     add_staten_island_ferry(
         stations,
         station_index_by_id,
